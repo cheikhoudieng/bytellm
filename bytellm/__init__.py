@@ -1,0 +1,58 @@
+"""
+ByteLLM: Tokenizer-Free Raw Byte Large Language Model (0-255)
+with Hierarchical Latent Patching, Recursive Abstract Reasoning,
+and Grammar-Constrained Native Binary Generation.
+"""
+
+from bytellm.codec import (
+    ByteCodec,
+    BinaryDomain,
+    BinaryValidator,
+    MIDIBuilder,
+    WASMBuilder,
+    ASMBuilder,
+    PCAPBuilder,
+    WAVBuilder,
+    CompressedBuilder,
+    compute_shannon_entropy,
+)
+from bytellm.model import (
+    ByteLLMConfig,
+    ByteLLM,
+    AbstractReasoningCore,
+    DynamicBytePatcher,
+)
+from bytellm.constraints import (
+    BinaryLogitProcessor,
+    DomainGrammarConstraint,
+)
+from bytellm.training import (
+    ByteLLMTrainer,
+    TrainingConfig,
+    MultiModalBinaryDataset,
+    evaluate_bits_per_byte,
+)
+
+__version__ = "1.0.0"
+__all__ = [
+    "ByteCodec",
+    "BinaryDomain",
+    "BinaryValidator",
+    "MIDIBuilder",
+    "WASMBuilder",
+    "ASMBuilder",
+    "PCAPBuilder",
+    "WAVBuilder",
+    "CompressedBuilder",
+    "compute_shannon_entropy",
+    "ByteLLMConfig",
+    "ByteLLM",
+    "AbstractReasoningCore",
+    "DynamicBytePatcher",
+    "BinaryLogitProcessor",
+    "DomainGrammarConstraint",
+    "ByteLLMTrainer",
+    "TrainingConfig",
+    "MultiModalBinaryDataset",
+    "evaluate_bits_per_byte",
+]
