@@ -46,7 +46,9 @@ class ByteLLMConfig:
     dropout: float = 0.05
     rope_theta: float = 10000.0
     ponder_loss_weight: float = 0.01
-
+    # Ablation switches (all True = the full ByteLLM architecture)
+    use_bitplane: bool = True
+    use_local_encoder: bool = True
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
@@ -70,9 +72,12 @@ class BitPlaneByteEmbedding(nn.Module):
     bits (LEB128/VLQ/MIDI), bitmasks, XOR parity, and nibble alignment.
     """
 
-    def __init__(self, vocab_size: int, d_model: int) -> None:
+    def __init__(self, vocab_size: int, d_model: int, structural: bool = True) -> None:
         super().__init__()
+        self.structural_enabled = structural
         self.token_emb = nn.Embedding(vocab_size, d_model)
+        if not structural:
+            return
         self.bit_proj = nn.Linear(8, d_model, bias=False)
         self.high_nibble_emb = nn.Embedding(16, d_model // 2)
         self.low_nibble_emb = nn.Embedding(16, d_model - (d_model // 2))
@@ -87,6 +92,8 @@ class BitPlaneByteEmbedding(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         base = self.token_emb(input_ids)
+        if not self.structural_enabled:
+            return base
         is_raw_byte = (input_ids < 256).unsqueeze(-1).to(base.dtype)
         clamped_bytes = input_ids.clamp(0, 255)
 
@@ -436,8 +443,8 @@ class ByteLLM(nn.Module):
         self.config = config or ByteLLMConfig()
         c = self.config
 
-        self.byte_emb = BitPlaneByteEmbedding(c.vocab_size, c.d_model)
-        self.local_encoder = LocalByteEncoder(c.d_model)
+        self.byte_emb = BitPlaneByteEmbedding(c.vocab_size, c.d_model, structural=c.use_bitplane)
+        self.local_encoder = LocalByteEncoder(c.d_model) if c.use_local_encoder else nn.Identity()
         self.patcher = DynamicBytePatcher(c.d_model, patch_size=c.patch_size)
 
         head_dim = c.d_model // c.n_heads
@@ -638,4 +645,53 @@ class ByteLLM(nn.Module):
 
     def count_parameters(self) -> int:
         """Return total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class VanillaByteTransformer(nn.Module):
+    """
+    Standard decoder-only byte transformer used as the reference baseline:
+    plain byte embedding -> N identical RoPE/SwiGLU causal blocks at full byte
+    resolution -> tied LM head. No bit-planes, no local conv encoder, no patching,
+    no reasoning core. Uses the very same `TransformerBlock`, optimizer, data and
+    init as `ByteLLM`, so any BPB difference comes from the architecture alone.
+    """
+
+    def __init__(self, config: Optional[ByteLLMConfig] = None) -> None:
+        super().__init__()
+        self.config = config or ByteLLMConfig()
+        c = self.config
+        self.token_emb = nn.Embedding(c.vocab_size, c.d_model)
+        self.rope = RotaryEmbedding(c.d_model // c.n_heads, max_seq_len=c.max_seq_len, theta=c.rope_theta)
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(c.d_model, c.n_heads, c.d_ff, c.dropout) for _ in range(c.n_layers)]
+        )
+        self.final_norm = RMSNorm(c.d_model)
+        self.lm_head = nn.Linear(c.d_model, c.vocab_size, bias=False)
+        self.lm_head.weight = self.token_emb.weight
+        self.apply(ByteLLM._init_weights)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        entropy_targets: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        x = self.token_emb(input_ids)
+        cos, sin = self.rope(x, input_ids.shape[1])
+        for block in self.blocks:
+            x = block(x, cos, sin)
+        logits = self.lm_head(self.final_norm(x))
+        one = torch.ones((), device=logits.device)
+        result: Dict[str, torch.Tensor] = {"logits": logits, "ponder_cost": one}
+        if targets is not None:
+            ce = F.cross_entropy(
+                logits.reshape(-1, self.config.vocab_size),
+                targets.reshape(-1),
+                ignore_index=SPECIAL_TOKENS.PAD,
+            )
+            result.update(loss=ce, ce_loss=ce, bpb=ce / math.log(2.0))
+        return result
+
+    def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

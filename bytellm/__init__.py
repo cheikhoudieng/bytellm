@@ -19,6 +19,7 @@ from bytellm.codec import (
 from bytellm.model import (
     ByteLLMConfig,
     ByteLLM,
+    VanillaByteTransformer,
     AbstractReasoningCore,
     DynamicBytePatcher,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "compute_shannon_entropy",
     "ByteLLMConfig",
     "ByteLLM",
+    "VanillaByteTransformer",
     "AbstractReasoningCore",
     "DynamicBytePatcher",
     "BinaryLogitProcessor",

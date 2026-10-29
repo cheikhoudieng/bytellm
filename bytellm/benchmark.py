@@ -37,7 +37,12 @@ from torch.utils.data import Dataset
 
 from bytellm.codec import BinaryDomain, compute_shannon_entropy
 from bytellm.corpus import measure_validity_rate
-from bytellm.model import ByteLLM, ByteLLMConfig
+from bytellm.model import (
+    ByteLLM,
+    ByteLLMConfig,
+    TransformerBlock,
+    VanillaByteTransformer,
+)
 from bytellm.training import (
     ByteLLMTrainer,
     MultiModalBinaryDataset,
@@ -55,7 +60,14 @@ PRESETS: Dict[str, Dict[str, int]] = {
 }
 
 
-def make_config(preset: str, seq_len: int, reasoning_steps: int) -> ByteLLMConfig:
+def make_config(
+    preset: str,
+    seq_len: int,
+    reasoning_steps: int,
+    patch_size: int = 4,
+    use_bitplane: bool = True,
+    use_local_encoder: bool = True,
+) -> ByteLLMConfig:
     p = PRESETS[preset]
     return ByteLLMConfig(
         d_model=p["d_model"],
@@ -64,7 +76,30 @@ def make_config(preset: str, seq_len: int, reasoning_steps: int) -> ByteLLMConfi
         d_ff=int(p["d_model"] * 2.75),
         max_seq_len=seq_len,
         reasoning_steps=reasoning_steps,
+        patch_size=patch_size,
+        use_bitplane=use_bitplane,
+        use_local_encoder=use_local_encoder,
     )
+
+
+def match_vanilla_layers(cfg: ByteLLMConfig) -> int:
+    """Number of vanilla blocks whose total parameters best match the ByteLLM config."""
+    target = ByteLLM(cfg).count_parameters()
+    block = TransformerBlock(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.dropout)
+    per_block = sum(p.numel() for p in block.parameters())
+    base = cfg.vocab_size * cfg.d_model + cfg.d_model  # tied embedding + final norm
+    return max(1, round((target - base) / per_block))
+
+
+def make_tag(args) -> str:
+    if args.arch == "vanilla":
+        return f"vanilla_{args.preset}_s{args.seed}"
+    flags = ""
+    if args.no_bitplane:
+        flags += "_nobit"
+    if args.no_local_encoder:
+        flags += "_noconv"
+    return f"bytellm_{args.preset}_r{args.reasoning_steps}_p{args.patch_size}{flags}_s{args.seed}"
 
 
 class ByteStreamDataset(Dataset):
@@ -137,7 +172,17 @@ def run_enwik8(args, device: str) -> Dict:
     test_ds = ByteStreamDataset(test_b, args.seq_len)
 
     torch.manual_seed(args.seed)
-    model = ByteLLM(make_config(args.preset, args.seq_len, args.reasoning_steps))
+    cfg = make_config(
+        args.preset, args.seq_len, args.reasoning_steps, args.patch_size,
+        not args.no_bitplane, not args.no_local_encoder,
+    )
+    if args.arch == "vanilla":
+        cfg.n_layers = args.vanilla_layers or match_vanilla_layers(cfg)
+        model = VanillaByteTransformer(cfg)
+    else:
+        model = ByteLLM(cfg)
+    tag = make_tag(args)
+    print(f"model={tag} params={model.count_parameters():,}", flush=True)
     trainer = ByteLLMTrainer(
         model,
         TrainingConfig(
@@ -161,11 +206,18 @@ def run_enwik8(args, device: str) -> Dict:
     test = evaluate_bits_per_byte(model, test_ds, batch_size=args.batch_size, device=device)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    trainer.save_checkpoint(out_dir / f"bytellm_{args.preset}_r{args.reasoning_steps}.pt")
+    trainer.save_checkpoint(out_dir / f"{tag}.pt")
 
     return {
+        "tag": tag,
+        "arch": args.arch,
         "preset": args.preset,
-        "reasoning_steps": args.reasoning_steps,
+        "seed": args.seed,
+        "reasoning_steps": args.reasoning_steps if args.arch == "bytellm" else None,
+        "patch_size": args.patch_size if args.arch == "bytellm" else None,
+        "bitplane": (not args.no_bitplane) if args.arch == "bytellm" else None,
+        "local_encoder": (not args.no_local_encoder) if args.arch == "bytellm" else None,
+        "n_layers": cfg.n_layers,
         "parameters": model.count_parameters(),
         "dataset_bytes": n,
         "train_bytes_seen": args.steps * args.batch_size * args.seq_len,
@@ -205,6 +257,12 @@ def main(argv=None) -> int:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--max-mb", type=float, default=2.0, help="MB of enwik8 to use (full = 100)")
     ap.add_argument("--reasoning-steps", type=int, default=3, help="1 disables recurrent pondering (ablation)")
+    ap.add_argument("--arch", choices=["bytellm", "vanilla"], default="bytellm",
+                    help="vanilla = standard byte transformer baseline (parameter-matched)")
+    ap.add_argument("--vanilla-layers", type=int, default=0, help="override auto parameter matching")
+    ap.add_argument("--patch-size", type=int, default=4, help="1 removes patch compression (ablation)")
+    ap.add_argument("--no-bitplane", action="store_true", help="ablation: plain byte embedding")
+    ap.add_argument("--no-local-encoder", action="store_true", help="ablation: remove multi-scale conv encoder")
     ap.add_argument("--amp", action="store_true", help="fp16 mixed precision (CUDA)")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--domains", type=int, default=4, help="samples per domain for validity (0 = skip)")
@@ -214,15 +272,15 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device={device} preset={args.preset} reasoning_steps={args.reasoning_steps}", flush=True)
+    print(f"device={device} arch={args.arch} preset={args.preset}", flush=True)
     result = run_enwik8(args, device)
     model = result.pop("_model")
-    if args.domains > 0:
+    if args.domains > 0 and args.arch == "bytellm":
         result["domains"] = run_domains(model, args.domains, device)
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"results_{args.preset}_r{args.reasoning_steps}.json"
+    path = out / f"results_{result['tag']}.json"
     path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
     print(f"\nsaved {path}")

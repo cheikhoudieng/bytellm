@@ -268,6 +268,38 @@ def test_corpus_pipeline_all_domains(tmp_path: Path):
     assert 0.0 <= rate <= 1.0
 
 
+def test_baseline_and_ablation_variants_are_causal_and_matched():
+    """Vanilla baseline and every ablation switch must train-forward and stay causal."""
+    from bytellm.benchmark import make_config, match_vanilla_layers
+    from bytellm.model import VanillaByteTransformer
+
+    torch.manual_seed(0)
+    base = make_config("tiny", 64, 3)
+    variants = {
+        "full": ByteLLM(base),
+        "r1": ByteLLM(make_config("tiny", 64, 1)),
+        "patch1": ByteLLM(make_config("tiny", 64, 3, patch_size=1)),
+        "patch8": ByteLLM(make_config("tiny", 64, 3, patch_size=8)),
+        "nobit": ByteLLM(make_config("tiny", 64, 3, use_bitplane=False)),
+        "noconv": ByteLLM(make_config("tiny", 64, 3, use_local_encoder=False)),
+    }
+    van_cfg = make_config("tiny", 64, 3)
+    van_cfg.n_layers = match_vanilla_layers(base)
+    variants["vanilla"] = VanillaByteTransformer(van_cfg)
+
+    x = torch.randint(0, 256, (2, 33))
+    x2 = x.clone()
+    x2[:, 20] = (x2[:, 20] + 1) % 256
+    for name, m in variants.items():
+        m.eval()
+        out = m(x, targets=x)
+        assert torch.isfinite(out["loss"]), name
+        assert torch.allclose(m(x)["logits"][:, :20], m(x2)["logits"][:, :20], atol=1e-5), name
+
+    ratio = variants["vanilla"].count_parameters() / variants["full"].count_parameters()
+    assert 0.8 < ratio < 1.2, ratio  # parameter-matched within 20%
+
+
 def test_constrained_generation_and_training_convergence(tmp_path: Path):
     """
     Verify grammar-constrained binary generation, training BPB reduction, and CLI demo.
@@ -289,6 +321,7 @@ if __name__ == "__main__":
     test_native_wav_audio_synthesis()
     test_bytellm_causality_and_abstract_reasoning()
     test_text_domain_and_instruction_codec()
+    test_baseline_and_ablation_variants_are_causal_and_matched()
     import tempfile
     test_corpus_pipeline_all_domains(Path(tempfile.mkdtemp()))
     test_constrained_generation_and_training_convergence(Path("scratch_test"))
