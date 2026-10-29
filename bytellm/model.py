@@ -140,11 +140,12 @@ class LocalByteEncoder(nn.Module):
         self.conv5 = CausalDepthwiseConv1d(d_model, kernel_size=5)
         self.conv9 = CausalDepthwiseConv1d(d_model, kernel_size=9)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.gate = nn.Parameter(torch.tensor(0.2))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
         ms = (self.conv3(h) + self.conv5(h) + self.conv9(h)) / 3.0
-        return x + self.out_proj(ms)
+        return x + torch.tanh(self.gate) * self.out_proj(ms)
 
 
 class RotaryEmbedding(nn.Module):
@@ -257,11 +258,11 @@ class TransformerBlock(nn.Module):
 
 class DynamicBytePatcher(nn.Module):
     """
-    Entropy-Aware Hierarchical Byte Patcher (BLT / MegaByte hybrid).
-    Computes an online byte-level unpredictability score (entropy proxy) and
-    pools contiguous byte blocks of size `patch_size` into latent patch tokens,
-    then unpools latent context back to fine-grained byte positions while
-    strictly preserving autoregressive causality.
+    Entropy-Aware Hierarchical Byte Patcher (Causal Multi-Scale Branch).
+    Instead of discarding fine-grained byte states by forcing all Transformer
+    layers through a shifted coarse bottleneck, this module builds a strictly
+    causal patch-level summary branch and fuses it back into the full-resolution
+    byte stream via a learned residual gate.
     """
 
     def __init__(self, d_model: int, patch_size: int = 4) -> None:
@@ -271,38 +272,49 @@ class DynamicBytePatcher(nn.Module):
             RMSNorm(d_model),
             nn.Linear(d_model, 1),
         )
-        self.down_proj = nn.Linear(d_model * self.patch_size, d_model, bias=False)
-        self.up_proj = nn.Linear(d_model, d_model * self.patch_size, bias=False)
-        self.fuse_gate = nn.Linear(d_model * 2, d_model)
+        if self.patch_size > 1:
+            self.norm = RMSNorm(d_model)
+            self.down_proj = nn.Linear(d_model * self.patch_size, d_model, bias=False)
+            self.up_proj = nn.Linear(d_model, d_model * self.patch_size, bias=False)
+            self.res_scale = nn.Parameter(torch.zeros(1))
 
     def forward(
         self, byte_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """
-        Downsample causal byte states `(B, T, D)` into latent patches `(B, P, D)`.
-        Shifts by 1 patch when unpooling so patch `p` only conditions bytes in patch `p+1`,
-        guaranteeing zero future-byte leakage within the same patch!
+        Compute causal entropy predictions and fuse hierarchical patch summaries
+        into `byte_states` `(B, T, D)` without losing 1-byte resolution.
         """
         B, T, D = byte_states.shape
         P_size = self.patch_size
-        # Predict local byte entropy / boundary salience score in [0, 8] bits
-        entropy_pred = 8.0 * torch.sigmoid(self.entropy_head(byte_states).squeeze(-1))
+        # Detach input for auxiliary entropy estimation so it never distorts LM features
+        entropy_pred = 8.0 * torch.sigmoid(self.entropy_head(byte_states.detach()).squeeze(-1))
 
+        if P_size <= 1:
+            return byte_states, entropy_pred, T
+
+        h = self.norm(byte_states)
         pad_len = (P_size - (T % P_size)) % P_size
         if pad_len > 0:
-            padded = F.pad(byte_states, (0, 0, 0, pad_len))
+            padded = F.pad(h, (0, 0, 0, pad_len))
             ent_padded = F.pad(entropy_pred, (0, pad_len))
         else:
-            padded = byte_states
+            padded = h
             ent_padded = entropy_pred
 
         num_patches = padded.shape[1] // P_size
         grouped = padded.view(B, num_patches, P_size, D)
-        # Weight bytes within each patch by their predicted information density
         ent_weights = F.softmax(ent_padded.view(B, num_patches, P_size, 1), dim=2)
         weighted = grouped * (1.0 + ent_weights)
-        patches = self.down_proj(weighted.reshape(B, num_patches, P_size * D))
-        return patches, entropy_pred, T
+        patches = F.silu(self.down_proj(weighted.reshape(B, num_patches, P_size * D)))
+
+        # Shift patch summaries right by 1 patch so patch p only conditions patches >= p+1
+        zero_patch = torch.zeros(B, 1, D, device=patches.device, dtype=patches.dtype)
+        shifted_patches = torch.cat([zero_patch, patches[:, :-1, :]], dim=1)
+        unpooled = self.up_proj(shifted_patches).view(B, num_patches * P_size, D)[:, :T, :]
+
+        enriched = byte_states + torch.tanh(self.res_scale) * unpooled
+        return enriched, entropy_pred, T
 
     def unpool_causal(
         self,
@@ -310,23 +322,8 @@ class DynamicBytePatcher(nn.Module):
         patch_states: torch.Tensor,
         orig_len: int,
     ) -> torch.Tensor:
-        """
-        Project latent patch representations back to byte resolution with a strict
-        1-patch causal shift: patch `p` summarizes bytes `[p*S .. (p+1)*S - 1]` and
-        conditions bytes `[(p+1)*S .. (p+2)*S - 1]`.
-        """
-        B, num_patches, D = patch_states.shape
-        P_size = self.patch_size
-
-        # Shift patch states right by 1 so patch p only informs subsequent patches
-        zero_patch = torch.zeros(B, 1, D, device=patch_states.device, dtype=patch_states.dtype)
-        shifted_patches = torch.cat([zero_patch, patch_states[:, :-1, :]], dim=1)
-
-        unpooled = self.up_proj(shifted_patches).view(B, num_patches * P_size, D)
-        unpooled = unpooled[:, :orig_len, :]
-
-        gate = torch.sigmoid(self.fuse_gate(torch.cat([byte_states, unpooled], dim=-1)))
-        return byte_states + gate * unpooled
+        """Identity pass-through since patch_states are already at full causal byte resolution."""
+        return patch_states
 
 
 class AbstractReasoningCore(nn.Module):
@@ -334,13 +331,10 @@ class AbstractReasoningCore(nn.Module):
     System-2 Recurrent Abstract Reasoning Core with Working-Memory Scratchpad Registers
     and Adaptive Computation Time (ACT) Halting Gate.
 
-    Iteratively refines latent representations over `max_steps` recurrent loops.
-    At each pondering step:
-    1. Attends to a bank of learnable Working-Memory Registers (modeling abstract
-       invariants such as stack depth, checksum accumulators, or harmonic rules).
-    2. Passes through a shared-weight recurrent Transformer reasoning block.
-    3. Computes a per-position halting probability `h_t` to dynamically allocate
-       compute to complex algorithmic/binary positions.
+    Operates at full causal byte resolution with clean pre-norm residual connections:
+    1. Queries learnable Working-Memory Registers via a zero-initialized residual gate.
+    2. Refines representations over `max_steps` recurrent causal Transformer steps
+       without polluting the residual stream with step embeddings.
     """
 
     def __init__(
@@ -363,8 +357,10 @@ class AbstractReasoningCore(nn.Module):
         self.mem_q = nn.Linear(d_model, d_model, bias=False)
         self.mem_kv = nn.Linear(d_model, 2 * d_model, bias=False)
         self.mem_out = nn.Linear(d_model, d_model, bias=False)
+        self.mem_gate = nn.Parameter(torch.zeros(1))
 
         self.reason_block = TransformerBlock(d_model, n_heads, d_ff, dropout)
+        self.step_scale = nn.Parameter(torch.ones(self.max_steps) / float(self.max_steps))
         self.halt_gate = nn.Sequential(
             RMSNorm(d_model),
             nn.Linear(d_model, 1),
@@ -376,54 +372,47 @@ class AbstractReasoningCore(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Run recurrent latent pondering.
-        Returns:
-            refined_state: (B, T, D)
-            ponder_cost: scalar tensor (mean number of pondering steps taken)
-            step_depths: (B, T) effective reasoning depth per token
-        """
         B, T, D = x.shape
         state = x
-        accumulated_state = torch.zeros_like(x)
-        halting_prob = torch.zeros(B, T, 1, device=x.device, dtype=x.dtype)
+        accumulated_delta = torch.zeros_like(x)
         remainders = torch.ones(B, T, 1, device=x.device, dtype=x.dtype)
         n_updates = torch.zeros(B, T, 1, device=x.device, dtype=x.dtype)
 
         mem = self.memory_registers.expand(B, -1, -1).to(x.dtype)
         kv = self.mem_kv(mem).view(B, self.num_registers, 2, D)
         mem_k, mem_v = kv.unbind(dim=2)
+        g_mem = torch.tanh(self.mem_gate)
 
         for step in range(self.max_steps):
             step_vec = self.step_emb(
                 torch.tensor(step, device=x.device)
             ).view(1, 1, D).to(x.dtype)
-            state_in = state + step_vec
 
-            # Cross-attend to working-memory registers
-            q = self.mem_q(self.mem_norm(state_in))
+            # Query working-memory registers using step-conditioned normalized state
+            q = self.mem_q(self.mem_norm(state + step_vec))
             attn_scores = torch.matmul(q, mem_k.transpose(-1, -2)) / math.sqrt(D)
             attn_probs = F.softmax(attn_scores, dim=-1)
             mem_ctx = self.mem_out(torch.matmul(attn_probs, mem_v))
-            state = state_in + mem_ctx
+            state_with_mem = state + g_mem * mem_ctx
 
-            # Recurrent causal reasoning block
-            state = self.reason_block(state, cos, sin)
+            # Recurrent causal reasoning block (clean residual inside reason_block)
+            next_state = self.reason_block(state_with_mem, cos, sin)
+            delta = next_state - state
+            state = state + self.step_scale[step] * delta
 
             if step == self.max_steps - 1:
                 p_halt = remainders
             else:
-                raw_p = torch.sigmoid(self.halt_gate(state))
+                raw_p = torch.sigmoid(self.halt_gate(state.detach()))
                 p_halt = torch.minimum(raw_p, remainders)
 
-            accumulated_state = accumulated_state + p_halt * state
-            halting_prob = halting_prob + p_halt
+            accumulated_delta = accumulated_delta + p_halt * (state - x)
             remainders = (remainders - p_halt).clamp(min=0.0)
             n_updates = n_updates + (remainders > 1e-4).to(x.dtype)
 
         ponder_cost = (n_updates + remainders).mean()
         step_depths = (n_updates + remainders).squeeze(-1)
-        return accumulated_state, ponder_cost, step_depths
+        return x + accumulated_delta, ponder_cost, step_depths
 
 
 class ByteLLM(nn.Module):
