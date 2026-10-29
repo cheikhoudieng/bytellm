@@ -220,6 +220,10 @@ def main(argv=None) -> int:
     train_p.add_argument("--d-model", type=int, default=256)
     train_p.add_argument("--layers", type=int, default=4)
     train_p.add_argument("--heads", type=int, default=8)
+    train_p.add_argument("--patch-size", type=int, default=1)
+    train_p.add_argument("--reasoning-steps", type=int, default=1)
+    train_p.add_argument("--log-every", type=int, default=100)
+    train_p.add_argument("--lr", type=float, default=6e-4)
 
     gen_p = sub.add_parser("generate", help="Generate a file from a checkpoint and a natural-language instruction")
     gen_p.add_argument("--ckpt", type=Path, required=True)
@@ -251,15 +255,27 @@ def main(argv=None) -> int:
             n_heads=args.heads,
             d_ff=int(args.d_model * 2.75),
             max_seq_len=args.seq_len,
+            patch_size=args.patch_size,
+            reasoning_steps=args.reasoning_steps,
         )
         model = ByteLLM(cfg)
+        print(
+            f"ByteLLM initialized: {model.count_parameters():,} parameters "
+            f"(d_model={args.d_model}, layers={args.layers}, heads={args.heads}) | "
+            f"train={len(train_ds):,} chunks, val={len(val_ds):,} chunks",
+            flush=True,
+        )
         trainer = ByteLLMTrainer(
             model,
             TrainingConfig(
                 batch_size=args.batch_size,
+                learning_rate=args.lr,
+                min_learning_rate=args.lr / 10.0,
                 max_steps=args.steps,
                 warmup_steps=max(1, args.steps // 20),
                 seq_len=args.seq_len,
+                amp=torch.cuda.is_available(),
+                log_every=args.log_every,
             ),
         )
         sampler = build_mixture_sampler(train_ds, parse_domain_weights(args.weights))

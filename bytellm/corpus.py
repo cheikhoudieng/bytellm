@@ -101,11 +101,14 @@ class CorpusDataset(Dataset):
         seq_len: int = 256,
         val_fraction: float = 0.1,
         max_file_bytes: int = 64 * 1024 * 1024,
+        compute_entropy: bool = False,
     ) -> None:
         super().__init__()
         assert split in ("train", "val")
         self.seq_len = seq_len
+        self.compute_entropy = compute_entropy
         self.records: List[_Record] = []
+        self._file_cache: Dict[Path, bytes] = {}
         want_val = split == "val"
 
         if root is not None:
@@ -159,9 +162,13 @@ class CorpusDataset(Dataset):
     def _tokens(self, r: _Record) -> Tuple[List[int], int]:
         if r.tokens is not None:
             return list(r.tokens), r.response_start
-        with open(r.path, "rb") as fh:
-            fh.seek(r.offset)
-            chunk = fh.read(r.length)
+        assert r.path is not None
+        buf = self._file_cache.get(r.path)
+        if buf is None:
+            buf = r.path.read_bytes()
+            if len(self._file_cache) < 2048:
+                self._file_cache[r.path] = buf
+        chunk = buf[r.offset : r.offset + r.length]
         toks = [SPECIAL_TOKENS.BOS, DOMAIN_TO_TOKEN[r.domain]] + list(chunk)
         if r.last:
             toks.append(SPECIAL_TOKENS.EOS)
@@ -170,13 +177,19 @@ class CorpusDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens, resp_start = self._tokens(self.records[idx])
         n = self.seq_len + 1
-        tokens = (tokens + [SPECIAL_TOKENS.PAD] * n)[:n]
+        if len(tokens) < n:
+            tokens = tokens + [SPECIAL_TOKENS.PAD] * (n - len(tokens))
+        else:
+            tokens = tokens[:n]
         x = torch.tensor(tokens[:-1], dtype=torch.long)
         y = torch.tensor(tokens[1:], dtype=torch.long)
         if resp_start > 0:
             y[: max(0, resp_start - 1)] = SPECIAL_TOKENS.PAD  # mask the instruction
-        raw = [t if 0 <= t <= 255 else 0 for t in tokens[:-1]]
-        ent = torch.from_numpy(compute_shannon_entropy(raw, window_size=16)).float()
+        if self.compute_entropy:
+            raw = [t if 0 <= t <= 255 else 0 for t in tokens[:-1]]
+            ent = torch.from_numpy(compute_shannon_entropy(raw, window_size=16)).float()
+        else:
+            ent = torch.empty(0, dtype=torch.float32)
         return x, y, ent
 
 
@@ -208,7 +221,10 @@ def build_mixture_sampler(
 
 
 def evaluate_per_domain(
-    model: ByteLLM, dataset: CorpusDataset, batch_size: int = 8
+    model: ByteLLM,
+    dataset: CorpusDataset,
+    batch_size: int = 8,
+    max_samples_per_domain: int = 512,
 ) -> Dict[str, Dict[str, float]]:
     """Bits-per-byte, byte perplexity and sample count for each domain separately."""
     by_domain: Dict[BinaryDomain, List[int]] = {}
@@ -216,7 +232,11 @@ def evaluate_per_domain(
         by_domain.setdefault(d, []).append(i)
     return {
         d.value: {
-            **evaluate_bits_per_byte(model, Subset(dataset, idxs), batch_size=batch_size),
+            **evaluate_bits_per_byte(
+                model,
+                Subset(dataset, idxs[:max_samples_per_domain]),
+                batch_size=batch_size,
+            ),
             "samples": float(len(idxs)),
         }
         for d, idxs in by_domain.items()

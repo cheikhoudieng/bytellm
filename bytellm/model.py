@@ -517,7 +517,7 @@ class ByteLLM(nn.Module):
             )
             bpb = ce_loss / math.log(2.0)
             total_loss = ce_loss + self.config.ponder_loss_weight * ponder_cost
-            if entropy_targets is not None:
+            if entropy_targets is not None and entropy_targets.numel() == entropy_pred.numel():
                 ent_loss = F.mse_loss(entropy_pred, entropy_targets.to(entropy_pred.dtype))
                 total_loss = total_loss + 0.05 * ent_loss
             result["loss"] = total_loss
