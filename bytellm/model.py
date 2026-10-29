@@ -538,6 +538,7 @@ class ByteLLM(nn.Module):
         use_grammar_constraints: bool = True,
         allow_thinking: bool = False,
         instruction: Optional[str] = None,
+        repetition_penalty: float = 1.0,
     ) -> Tuple[bytes, bytes, Dict[str, float]]:
         """
         Autoregressively generate raw binary payloads byte-by-byte without BPE.
@@ -583,6 +584,16 @@ class ByteLLM(nn.Module):
                 # Pass only tokens generated after the domain prefix to the FSM
                 gen_view = seq[:, prefix_len:]
                 next_logits = processor(gen_view, next_logits)
+
+            if repetition_penalty != 1.0 and seq.shape[1] > prefix_len:
+                gen_tokens = seq[0, prefix_len:]
+                counts = torch.bincount(gen_tokens, minlength=self.config.vocab_size)
+                penalized = counts > 0
+                next_logits[0, penalized] = torch.where(
+                    next_logits[0, penalized] > 0,
+                    next_logits[0, penalized] / repetition_penalty,
+                    next_logits[0, penalized] * repetition_penalty,
+                )
 
             if temperature <= 1e-5:
                 next_token = torch.argmax(next_logits, dim=-1, keepdim=True)

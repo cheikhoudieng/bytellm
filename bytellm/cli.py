@@ -210,6 +210,7 @@ def main(argv=None) -> int:
 
     train_p = sub.add_parser("train", help="Train on a real mixed corpus (text + binaries + instructions)")
     train_p.add_argument("--corpus", type=Path, help="Directory of files (any domain)")
+    train_p.add_argument("--extract-text-only", action="store_true", help="Extract pure .text executable code from ELF/PE")
     train_p.add_argument("--instructions", type=Path, help="JSONL of instruction pairs")
     train_p.add_argument("--weights", type=str, default=None, help="Domain mixture, e.g. text=0.4,wasm=0.1,midi=0.1")
     train_p.add_argument("--out-dir", type=Path, default=Path("run_out"))
@@ -225,6 +226,7 @@ def main(argv=None) -> int:
     gen_p.add_argument("--domain", type=str, default="text")
     gen_p.add_argument("--instruction", type=str, default=None)
     gen_p.add_argument("--max-bytes", type=int, default=256)
+    gen_p.add_argument("--repetition-penalty", type=float, default=1.0)
     gen_p.add_argument("--no-constraints", action="store_true")
     gen_p.add_argument("--out", type=Path, default=None)
 
@@ -281,6 +283,7 @@ def main(argv=None) -> int:
             domain=domain,
             instruction=args.instruction,
             max_new_bytes=args.max_bytes,
+            repetition_penalty=args.repetition_penalty,
             use_grammar_constraints=not args.no_constraints,
         )
         valid, msg = BinaryValidator.validate(payload, domain)

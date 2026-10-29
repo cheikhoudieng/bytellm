@@ -27,6 +27,12 @@ from bytellm.constraints import (
     BinaryLogitProcessor,
     DomainGrammarConstraint,
 )
+from bytellm.extractor import (
+    extract_executable_code,
+    extract_elf_text_section,
+    extract_pe_text_section,
+    build_c_asm_instruction_pairs,
+)
 from bytellm.training import (
     ByteLLMTrainer,
     TrainingConfig,
