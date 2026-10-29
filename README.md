@@ -1,6 +1,12 @@
 # ByteLLM — Modèle de Langage Natif sur Octets Bruts (0–255)
 
-**ByteLLM** est une architecture **Tokenizer-Free** prête pour la production qui opère directement sur le flux d'octets bruts (`0x00`–`0xFF`, soit `0..255`) sans aucun découpage sous-lexical de type BPE (*Tiktoken*, *SentencePiece* ou *WordPiece*).
+**ByteLLM** est une architecture **Tokenizer-Free** expérimentale qui opère directement sur le flux d'octets bruts (`0x00`–`0xFF`, soit `0..255`) sans aucun découpage sous-lexical de type BPE (*Tiktoken*, *SentencePiece* ou *WordPiece*).
+
+## Documentation Technique Complète (`docs/`)
+
+- 📊 **[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)** : Tous les résultats chiffrés vérifiables (`enwik8` 2 Mo & 20 Mo, ablation `reasoning_steps`, duel `VanillaByteTransformer` vs `ByteLLM` avant/après correction de l'angle mort causal, désassemblage `x86_64` `/usr/bin`, audit Capstone des sauts relatifs et *Scaling Sweep* contrôlé `4M / 14M / 58M` sur 60 bibliothèques `.so` inédites).
+- 🔍 **[`docs/ETAT_DU_PROJET.md`](docs/ETAT_DU_PROJET.md)** : Bilan sans filtre de ce qui est prouvé, de ce qui n'a pas surperformé les baselines, des bugs corrigés et des limites actuelles.
+- 🛠️ **[`docs/PISTES_AMELIORATION.md`](docs/PISTES_AMELIORATION.md)** : Feuille de route priorisée (passage à l'échelle des données/pas selon Chinchilla, alignement des sauts relatifs *forward* en `x86_64`, automates de contraintes complets et paires de décompilation).
 
 ## Caractéristiques Clés
 
