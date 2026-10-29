@@ -104,16 +104,19 @@ class CorpusDataset(Dataset):
         compute_entropy: bool = False,
     ) -> None:
         super().__init__()
-        assert split in ("train", "val")
+        assert split in ("train", "val", "all")
         self.seq_len = seq_len
         self.compute_entropy = compute_entropy
         self.records: List[_Record] = []
         self._file_cache: Dict[Path, bytes] = {}
         want_val = split == "val"
+        use_all = split == "all"  # no train/val split: every file (held-out test sets)
 
         if root is not None:
             for path in sorted(Path(root).rglob("*")):
-                if not path.is_file() or is_validation_file(path, val_fraction) != want_val:
+                if not path.is_file() or (
+                    not use_all and is_validation_file(path, val_fraction) != want_val
+                ):
                     continue
                 size = path.stat().st_size
                 if size == 0 or size > max_file_bytes:
@@ -128,7 +131,7 @@ class CorpusDataset(Dataset):
                     if not line:
                         continue
                     key = f"{Path(instructions).name}:{n}"
-                    if is_validation_file(key, val_fraction) != want_val:
+                    if not use_all and is_validation_file(key, val_fraction) != want_val:
                         continue
                     self._add_instruction(json.loads(line), base)
 
@@ -220,11 +223,19 @@ def build_mixture_sampler(
     )
 
 
+def _spread(idxs: List[int], n: int) -> List[int]:
+    """Pick `n` evenly spaced indices so the sample covers every file, not just the first ones."""
+    if n <= 0 or len(idxs) <= n:
+        return idxs
+    step = len(idxs) / n
+    return [idxs[int(i * step)] for i in range(n)]
+
+
 def evaluate_per_domain(
     model: ByteLLM,
     dataset: CorpusDataset,
     batch_size: int = 8,
-    max_samples_per_domain: int = 512,
+    max_samples_per_domain: int = 2000,
 ) -> Dict[str, Dict[str, float]]:
     """Bits-per-byte, byte perplexity and sample count for each domain separately."""
     by_domain: Dict[BinaryDomain, List[int]] = {}
@@ -234,7 +245,7 @@ def evaluate_per_domain(
         d.value: {
             **evaluate_bits_per_byte(
                 model,
-                Subset(dataset, idxs[:max_samples_per_domain]),
+                Subset(dataset, _spread(idxs, max_samples_per_domain)),
                 batch_size=batch_size,
             ),
             "samples": float(len(idxs)),

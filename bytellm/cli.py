@@ -225,6 +225,14 @@ def main(argv=None) -> int:
     train_p.add_argument("--log-every", type=int, default=100)
     train_p.add_argument("--lr", type=float, default=6e-4)
 
+    eval_p = sub.add_parser("evaluate", help="Evaluate a checkpoint (BPB per domain) on a directory of files")
+    eval_p.add_argument("--ckpt", type=Path, required=True)
+    eval_p.add_argument("--corpus", type=Path, required=True)
+    eval_p.add_argument("--split", choices=["val", "all"], default="all",
+                        help="'all' = every file (use for held-out sets never seen in training)")
+    eval_p.add_argument("--max-chunks", type=int, default=2000, help="evenly spaced chunks per domain")
+    eval_p.add_argument("--batch-size", type=int, default=16)
+
     gen_p = sub.add_parser("generate", help="Generate a file from a checkpoint and a natural-language instruction")
     gen_p.add_argument("--ckpt", type=Path, required=True)
     gen_p.add_argument("--domain", type=str, default="text")
@@ -290,6 +298,26 @@ def main(argv=None) -> int:
         }
         (args.out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(json.dumps(report, indent=2))
+        return 0
+
+    if args.command == "evaluate":
+        from bytellm.corpus import CorpusDataset, evaluate_per_domain
+
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        model, payload = ByteLLMTrainer.load_checkpoint(args.ckpt, device=dev)
+        ds = CorpusDataset(args.corpus, None, args.split, model.config.max_seq_len)
+        if len(ds) == 0:
+            parser.error("no files found to evaluate")
+        result = {
+            "ckpt": str(args.ckpt),
+            "parameters": model.count_parameters(),
+            "train_steps": payload.get("step_count"),
+            "chunks_total": len(ds),
+            "per_domain": evaluate_per_domain(
+                model, ds, batch_size=args.batch_size, max_samples_per_domain=args.max_chunks
+            ),
+        }
+        print(json.dumps(result, indent=2))
         return 0
 
     if args.command == "generate":
